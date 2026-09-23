@@ -67,7 +67,7 @@ use crate::Db;
 
 /// Semantic token types supported by the language server.
 ///
-/// The order matches basedpyright's legend.
+/// The order matches basedpyright's legend, followed by the types that only ty uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticTokenType {
     // This enum must be kept in sync with `all` and `as_lsp_concept` below.
@@ -86,11 +86,15 @@ pub enum SemanticTokenType {
     Decorator,
     SelfParameter,
     ClsParameter,
+    /// A string in the metadata of `Annotated[...]`, such as the shape of a jaxtyping array
+    /// (`Float[Tensor, "batch seq"]`). basedpyright has no token for these, and editors color
+    /// them like the type around them.
+    String,
 }
 
 impl SemanticTokenType {
     /// Returns all supported semantic token types as enum variants.
-    pub const fn all() -> [SemanticTokenType; 15] {
+    pub const fn all() -> [SemanticTokenType; 16] {
         [
             SemanticTokenType::Namespace,
             SemanticTokenType::Type,
@@ -107,6 +111,7 @@ impl SemanticTokenType {
             SemanticTokenType::Decorator,
             SemanticTokenType::SelfParameter,
             SemanticTokenType::ClsParameter,
+            SemanticTokenType::String,
         ]
     }
 
@@ -134,6 +139,7 @@ impl SemanticTokenType {
             SemanticTokenType::Decorator => "decorator",
             SemanticTokenType::SelfParameter => "selfParameter",
             SemanticTokenType::ClsParameter => "clsParameter",
+            SemanticTokenType::String => "string",
         }
     }
 }
@@ -2403,7 +2409,17 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                         {
                             self.visit_expr_with_flags(annotation, flags);
                             for element in metadata {
-                                self.visit_value(element);
+                                if let Expr::StringLiteral(string) = element {
+                                    self.add_classified(
+                                        string.range(),
+                                        Some((
+                                            SemanticTokenType::String,
+                                            SemanticTokenModifier::empty(),
+                                        )),
+                                    );
+                                } else {
+                                    self.visit_value(element);
+                                }
                             }
                         } else {
                             self.visit_expr_with_flags(&subscript.slice, flags);
@@ -5947,6 +5963,7 @@ e: "list['int']" = []
         "c" @ 85..86: Variable
         "Annotated" @ 88..97: Class
         "int" @ 98..101: Class [defaultLibrary, builtin]
+        "\"int\"" @ 103..108: String
         "d" @ 114..115: Variable
         "cast" @ 118..122: Function
         "a" @ 130..131: Variable
@@ -6440,6 +6457,36 @@ class D:
         "@" @ 199..200: Decorator
         "decorate" @ 200..208: Decorator
         "D" @ 215..216: Class [declaration]
+        "#);
+    }
+
+    #[test]
+    fn annotated_metadata_strings() {
+        let test = SemanticTokenTest::new(
+            r#"
+from typing import Annotated as Float
+
+from typing import Annotated
+
+def f(x: Float[int, "batch seq"], y: Annotated[int, "meta", 3]) -> None: ...
+"#,
+        );
+
+        assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
+        "typing" @ 6..12: Namespace
+        "Annotated" @ 20..29: Class
+        "Float" @ 33..38: Class
+        "typing" @ 45..51: Namespace
+        "Annotated" @ 59..68: Class
+        "f" @ 74..75: Function [declaration]
+        "x" @ 76..77: Parameter [declaration, parameter]
+        "Float" @ 79..84: Class
+        "int" @ 85..88: Class [defaultLibrary, builtin]
+        "\"batch seq\"" @ 90..101: String
+        "y" @ 104..105: Parameter [declaration, parameter]
+        "Annotated" @ 107..116: Class
+        "int" @ 117..120: Class [defaultLibrary, builtin]
+        "\"meta\"" @ 122..128: String
         "#);
     }
 
