@@ -1499,11 +1499,20 @@ fn keyword_argument<'db>(
                 | Type::GenericAlias(_)
         )
     );
-    let definitions = if resolves {
+    let mut definitions = if resolves {
         definitions_for_keyword_argument(model, keyword, call)
     } else {
         Vec::new()
     };
+    // The keywords of a function only resolve to its parameters. ty's synthesized methods (the
+    // `_replace` of a named tuple) point them to the fields instead.
+    if matches!(callee, Some(Type::FunctionLiteral(_) | Type::BoundMethod(_))) {
+        definitions.retain(|definition| {
+            definition.definition().is_some_and(|definition| {
+                matches!(definition.kind(db), DefinitionKind::Parameter(_))
+            })
+        });
+    }
 
     // Pyright never records a type for the keyword names of named tuple constructors.
     let is_named_tuple = match callee {
@@ -2354,6 +2363,84 @@ pub fn pyright_symbol_definition<'db>(
             .find(|definition| definition.kind(db).is_user_visible());
     }
     None
+}
+
+/// The declared type of an annotated variable or parameter.
+pub fn pyright_declared_type<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Option<Type<'db>> {
+    inferred_declaration(db, definition)
+        .declared()
+        .map(|declared| declared.inner_type())
+}
+
+/// Whether `ty` is an explicit `Any` (rather than an unknown type).
+pub fn pyright_is_explicit_any(ty: Type<'_>) -> bool {
+    matches!(ty, Type::Dynamic(DynamicType::Any))
+}
+
+/// Whether a definition is in `typing.pyi` or `typing_extensions.pyi`, whose variables pyright
+/// accepts in type expressions.
+pub fn pyright_is_in_typing_stub<'db>(db: &'db dyn Db, definition: Definition<'db>) -> bool {
+    let file = definition.program_file(db);
+    file.file(db).is_stub(db)
+        && file_to_module(db, file.resolver_file(db)).is_some_and(|module| {
+            matches!(module.name(db).as_str(), "typing" | "typing_extensions")
+        })
+}
+
+/// Whether pyright accepts a variable of type `ty` in a type expression without it being a type
+/// alias (`isLegalTypeFormForVariable`): type variables, and the classes that calls to `NewType`,
+/// `NamedTuple`, `TypedDict` or `Enum` create.
+pub fn pyright_is_type_form_variable_type(ty: Type<'_>) -> bool {
+    matches!(
+        ty,
+        Type::KnownInstance(KnownInstanceType::TypeVar(_) | KnownInstanceType::NewType(_))
+            | Type::ClassLiteral(
+                ClassLiteral::DynamicNamedTuple(_)
+                    | ClassLiteral::DynamicTypedDict(_)
+                    | ClassLiteral::DynamicEnum(_)
+            )
+    )
+}
+
+/// The return type of calling `callee`, for the callee types that pyright evaluates on their own:
+/// functions (with their inferred return type if they have no annotation) and classes.
+pub fn pyright_call_return_type<'db>(
+    model: &SemanticModel<'db>,
+    callee: Type<'db>,
+) -> Option<Type<'db>> {
+    let db = model.db();
+    match callee {
+        Type::FunctionLiteral(_) | Type::BoundMethod(_) => {
+            if let Some(inferred) = pyright_inferred_call_type(model, callee) {
+                return Some(inferred);
+            }
+            let function = match callee {
+                Type::FunctionLiteral(function) => function,
+                Type::BoundMethod(method) => method.function(db)?,
+                _ => return None,
+            };
+            let (overloads, _) = function.overloads_and_implementation(db);
+            if !overloads.is_empty() {
+                return None;
+            }
+            Some(function.signature(db).overloads.first()?.return_ty)
+        }
+        Type::ClassLiteral(_) | Type::GenericAlias(_) => {
+            Some(callee.to_instance(db, &model.program_environment())?.into_inner())
+        }
+        _ => None,
+    }
+}
+
+/// The type of a literal widened to its class (`Literal[1]` to `int`), the way pyright infers the
+/// type of a declaration without an annotation.
+pub fn pyright_widen_literal<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Type<'db> {
+    match ty {
+        Type::LiteralValue(literal) => {
+            literal.fallback_instance(model.db(), &model.program_environment())
+        }
+        _ => ty,
+    }
 }
 
 /// The union of `elements`, the way pyright combines the types of a symbol's declarations.
