@@ -4,7 +4,7 @@ use ruff_db::system::SystemPath;
 use crate::TestServerBuilder;
 
 #[test]
-fn script_metadata_is_highlighted_as_toml() -> Result<()> {
+fn script_metadata_is_not_highlighted() -> Result<()> {
     let workspace_root = SystemPath::new("src");
     let script = SystemPath::new("src/script.py");
     let source = r#"#!/usr/bin/env python3
@@ -40,20 +40,11 @@ value = 1
         })
         .collect();
 
+    // Like basedpyright, the server leaves the TOML in PEP 723 script metadata comments to the
+    // editor's syntax highlighting and only classifies the Python names.
     assert_eq!(
         actual,
-        vec![
-            (2, 2, 12, ty_ide::SemanticTokenType::Variable as u32),
-            (0, 13, 1, ty_ide::SemanticTokenType::Operator as u32),
-            (0, 2, 1, ty_ide::SemanticTokenType::Operator as u32),
-            (0, 1, 7, ty_ide::SemanticTokenType::String as u32),
-            (0, 7, 1, ty_ide::SemanticTokenType::Operator as u32),
-            (1, 2, 15, ty_ide::SemanticTokenType::Variable as u32),
-            (0, 16, 1, ty_ide::SemanticTokenType::Operator as u32),
-            (0, 2, 8, ty_ide::SemanticTokenType::String as u32),
-            (2, 0, 5, ty_ide::SemanticTokenType::Variable as u32),
-            (0, 8, 1, ty_ide::SemanticTokenType::Number as u32),
-        ]
+        vec![(5, 0, 5, ty_ide::SemanticTokenType::Variable as u32)]
     );
 
     Ok(())

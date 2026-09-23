@@ -4799,7 +4799,6 @@ dependencies = [
  "smallvec",
  "strum",
  "strum_macros",
- "toml_parser",
  "tracing",
  "ty_module_resolver",
  "ty_project",
