@@ -1375,12 +1375,16 @@ impl<'db> SemanticTokenVisitor<'db> {
         let mut name_type = self.name_type(ty, self.type_context_for(attribute.ctx));
 
         // Every member of an `Any` or unknown receiver has the receiver's type in pyright, while
-        // ty knows a few (`Unknown.__class__` is `type[Unknown]`).
+        // ty knows a few (`Unknown.__class__` is `type[Unknown]`). Both narrow the member to the
+        // type assigned to it, though.
         if has_type
             && let Some(receiver) = receiver
             && let Some(receiver_type) = receiver_type
             && receiver_type.is_any_or_unknown
             && !receiver_type.is_special_form
+            && ty.is_none_or(|ty| {
+                matches!(ty, Type::Dynamic(_)) || pyright_is_dynamic_class_object(ty)
+            })
         {
             name_type = Some((receiver, receiver_type));
         }
