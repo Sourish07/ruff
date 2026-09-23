@@ -305,6 +305,8 @@ struct SemanticTokenVisitor<'db> {
     /// ty has no definitions for the nodes of a string annotation, so the visitor resolves these
     /// names itself.
     string_lambda_parameters: Vec<Name>,
+    /// The names that the conditions of enclosing `if` and `while` statements pass to `hasattr()`.
+    hasattr_names: Vec<Name>,
     range_filter: Option<TextRange>,
 }
 
@@ -329,6 +331,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             unreachable: unreachable_ranges(model.db(), model.program_file()),
             unbound,
             string_lambda_parameters: Vec::new(),
+            hasattr_names: Vec::new(),
             range_filter,
         }
     }
@@ -1057,7 +1060,13 @@ impl<'db> SemanticTokenVisitor<'db> {
                 (bound, inferred) => bound.or(inferred),
             }
         } else {
-            name.inferred_type(self.model).or_else(bound_type)
+            match name.inferred_type(self.model) {
+                // ty narrows a name that an enclosing `hasattr()` check rules out to `Never`
+                // (`if not hasattr(self, "x")` where the class assigns `self.x`), while pyright's
+                // `hasattr()` doesn't narrow.
+                Some(Type::Never) if self.hasattr_names.contains(&name.id) => bound_type(),
+                inferred => inferred.or_else(bound_type),
+            }
         }
     }
 
@@ -1118,10 +1127,13 @@ impl<'db> SemanticTokenVisitor<'db> {
             .iter()
             .find_map(ResolvedDefinition::definition)
         })?;
-        let use_scope = self.execution_scope(self.model.scope(name.into())?);
+        let use_scope = self
+            .model
+            .scope(name.into())
+            .map(|scope| self.execution_scope(scope));
         let is_same_scope = |definition: Definition<'db>| {
             definition.file(db) == file
-                && self.execution_scope(definition.file_scope(db)) == use_scope
+                && Some(self.execution_scope(definition.file_scope(db))) == use_scope
         };
         let parsed = parsed_module(db, first.python_file(db)).load(db);
         let definitions: Vec<Definition<'db>> = pyright_symbol_declarations(self.model, first)
@@ -1424,6 +1436,12 @@ impl<'db> SemanticTokenVisitor<'db> {
     /// as `complete` in `self.transaction.complete()` where `transaction` is a property whose
     /// getter isn't annotated.
     fn receiver_type(&self, expr: &Expr) -> Option<Type<'db>> {
+        if let Expr::Name(name) = expr
+            && self.hasattr_names.contains(&name.id)
+        {
+            let declarations = self.name_declarations(name.id.as_str(), name.into());
+            return self.reachable_name_type(name, &declarations);
+        }
         let ty = expr.inferred_type(self.model);
         if ty.is_some_and(|ty| !ty.is_unknown()) {
             return ty;
@@ -2158,6 +2176,26 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
     }
 }
 
+/// Collects the names that `condition` passes to `hasattr()`, through `not`, `and` and `or`.
+fn collect_hasattr_names(condition: &Expr, names: &mut Vec<Name>) {
+    match condition {
+        Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(func) if func.id.as_str() == "hasattr") => {
+            if let Some(Expr::Name(name)) = call.arguments.args.first() {
+                names.push(name.id.clone());
+            }
+        }
+        Expr::UnaryOp(unary) if unary.op == ast::UnaryOp::Not => {
+            collect_hasattr_names(&unary.operand, names);
+        }
+        Expr::BoolOp(bool_op) => {
+            for value in &bool_op.values {
+                collect_hasattr_names(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl SemanticTokenVisitor<'_> {
     fn visit_stmt_without_flags(&mut self, stmt: &Stmt) {
         match stmt {
@@ -2339,6 +2377,12 @@ impl SemanticTokenVisitor<'_> {
                     }
                 }
                 self.visit_body(&with_stmt.body);
+            }
+            Stmt::If(ast::StmtIf { test, .. }) | Stmt::While(ast::StmtWhile { test, .. }) => {
+                let enclosing = self.hasattr_names.len();
+                collect_hasattr_names(test, &mut self.hasattr_names);
+                walk_stmt(self, stmt);
+                self.hasattr_names.truncate(enclosing);
             }
             _ => walk_stmt(self, stmt),
         }
