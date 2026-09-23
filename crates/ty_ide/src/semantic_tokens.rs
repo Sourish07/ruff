@@ -36,7 +36,7 @@ use ty_python_semantic::types::ide_support::pyright_tokens::{
     PyrightKeywordArgument, PyrightType, PyrightTypeCategory, PyrightTypeContext,
     pyright_attribute_declarations, pyright_declaration, pyright_declarations,
     pyright_definition_type, pyright_function_definition_is_static,
-    pyright_functional_named_tuple_field, pyright_has_declared_type,
+    pyright_functional_named_tuple_field, pyright_has_declared_type, pyright_inferred_call_type,
     pyright_is_dynamic_class_object, pyright_is_generic_class_subscript,
     pyright_is_narrowed_not_none, pyright_is_pseudo_generic_attribute,
     pyright_is_type_alias_declaration, pyright_keyword_arguments, pyright_member_type,
@@ -1327,7 +1327,7 @@ impl<'db> SemanticTokenVisitor<'db> {
         let name = attribute.attr.as_str();
         let reachability = self.reachability(attribute.range());
         let receiver = match reachability {
-            Reachability::Reachable => attribute.value.inferred_type(self.model),
+            Reachability::Reachable => self.receiver_type(&attribute.value),
             Reachability::Unevaluated | Reachability::Unbound => {
                 self.unevaluated_expression_type(&attribute.value)
             }
@@ -1413,6 +1413,47 @@ impl<'db> SemanticTokenVisitor<'db> {
         self.add_classified(attribute.attr.range(), classification);
     }
 
+    /// The type of the receiver of an attribute in reachable code.
+    ///
+    /// Pyright infers the return type of functions without a return annotation, while ty's type
+    /// for calling them is unknown. That makes a difference for the members of the result, such
+    /// as `complete` in `self.transaction.complete()` where `transaction` is a property whose
+    /// getter isn't annotated.
+    fn receiver_type(&self, expr: &Expr) -> Option<Type<'db>> {
+        let ty = expr.inferred_type(self.model);
+        if ty.is_some_and(|ty| !ty.is_unknown()) {
+            return ty;
+        }
+        let inferred = match expr {
+            Expr::Attribute(attribute) if attribute.ctx.is_load() => {
+                let receiver = self.receiver_type(&attribute.value)?;
+                self.member_read_type(receiver, attribute.attr.as_str())
+            }
+            Expr::Call(call) => self
+                .receiver_type(&call.func)
+                .and_then(|callee| pyright_inferred_call_type(self.model, callee)),
+            _ => None,
+        };
+        inferred.or(ty)
+    }
+
+    /// The type of reading `name` through `receiver`, with the inferred return type of a property
+    /// getter that has no return annotation.
+    fn member_read_type(&self, receiver: Type<'db>, name: &str) -> Option<Type<'db>> {
+        let declarations = pyright_attribute_declarations(self.model, receiver, name);
+        if let Some(declaration) = declarations.first()
+            && declaration.kind == PyrightDeclarationKind::Function
+            && let Some(definition) = declaration.definition
+            && let PyrightAccessor::Accessor {
+                effective_type: Some(effective_type),
+                ..
+            } = pyright_method_accessor(self.model, definition, &declarations, false)
+        {
+            return Some(effective_type);
+        }
+        pyright_member_type(self.model, receiver, name).filter(|ty| !ty.is_unknown())
+    }
+
     /// The type of `x.name` in reachable code.
     fn reachable_attribute_type(
         &self,
@@ -1456,9 +1497,21 @@ impl<'db> SemanticTokenVisitor<'db> {
         {
             return from_declaration();
         }
-        let ty = attribute
+        let mut ty = attribute
             .inferred_type(self.model)
             .or_else(from_declaration);
+        // ty has no type for the members of a receiver that only pyright's return type inference
+        // knows (see `receiver_type`).
+        if attribute.ctx.is_load()
+            && ty.is_none_or(|ty| ty.is_unknown())
+            && attribute
+                .value
+                .inferred_type(self.model)
+                .is_none_or(|ty| ty.is_unknown())
+            && let Some(member) = self.member_read_type(receiver, name)
+        {
+            ty = Some(member);
+        }
         match attribute.ctx {
             // ty narrows an unknown receiver to `Unknown & F` (after `isinstance(x, F)`), and the
             // attribute's type to `Unknown`; pyright narrows the receiver to `F`.
