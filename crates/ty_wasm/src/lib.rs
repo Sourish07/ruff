@@ -1561,44 +1561,40 @@ impl SemanticToken {
 #[repr(u32)]
 pub enum SemanticTokenKind {
     Namespace,
+    Type,
     Class,
+    Enum,
+    TypeParameter,
     Parameter,
-    SelfParameter,
-    ClsParameter,
     Variable,
     Property,
+    EnumMember,
     Function,
     Method,
     Keyword,
-    String,
-    Number,
     Decorator,
-    BuiltinConstant,
-    TypeParameter,
-    Operator,
-    Regexp,
+    SelfParameter,
+    ClsParameter,
 }
 
 impl From<ty_ide::SemanticTokenType> for SemanticTokenKind {
     fn from(value: ty_ide::SemanticTokenType) -> Self {
         match value {
             ty_ide::SemanticTokenType::Namespace => Self::Namespace,
+            ty_ide::SemanticTokenType::Type => Self::Type,
             ty_ide::SemanticTokenType::Class => Self::Class,
+            ty_ide::SemanticTokenType::Enum => Self::Enum,
+            ty_ide::SemanticTokenType::TypeParameter => Self::TypeParameter,
             ty_ide::SemanticTokenType::Parameter => Self::Parameter,
-            ty_ide::SemanticTokenType::SelfParameter => Self::SelfParameter,
-            ty_ide::SemanticTokenType::ClsParameter => Self::ClsParameter,
             ty_ide::SemanticTokenType::Variable => Self::Variable,
             ty_ide::SemanticTokenType::Property => Self::Property,
+            ty_ide::SemanticTokenType::EnumMember => Self::EnumMember,
             ty_ide::SemanticTokenType::Function => Self::Function,
             ty_ide::SemanticTokenType::Method => Self::Method,
             ty_ide::SemanticTokenType::Keyword => Self::Keyword,
-            ty_ide::SemanticTokenType::String => Self::String,
-            ty_ide::SemanticTokenType::Number => Self::Number,
             ty_ide::SemanticTokenType::Decorator => Self::Decorator,
-            ty_ide::SemanticTokenType::BuiltinConstant => Self::BuiltinConstant,
-            ty_ide::SemanticTokenType::TypeParameter => Self::TypeParameter,
-            ty_ide::SemanticTokenType::Operator => Self::Operator,
-            ty_ide::SemanticTokenType::Regexp => Self::Regexp,
+            ty_ide::SemanticTokenType::SelfParameter => Self::SelfParameter,
+            ty_ide::SemanticTokenType::ClsParameter => Self::ClsParameter,
         }
     }
 }

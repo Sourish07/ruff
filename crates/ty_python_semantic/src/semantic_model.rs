@@ -524,6 +524,12 @@ impl<'db> SemanticModel<'db> {
         }
     }
 
+    /// Whether this model analyzes the sub-AST of a string annotation (see
+    /// [`Self::enter_string_annotation`]).
+    pub fn is_in_string_annotation(&self) -> bool {
+        self.in_string_annotation_expr.is_some()
+    }
+
     /// Given a string expression, determine if it's a string annotation, and if it is,
     /// yield the parsed sub-AST and a sub-model that knows it's analyzing a sub-AST.
     ///

@@ -70,28 +70,31 @@ expression: initialization_result
       "legend": {
         "tokenTypes": [
           "namespace",
+          "type",
           "class",
+          "enum",
+          "typeParameter",
           "parameter",
-          "selfParameter",
-          "clsParameter",
           "variable",
           "property",
+          "enumMember",
           "function",
           "method",
           "keyword",
-          "string",
-          "number",
           "decorator",
-          "builtinConstant",
-          "typeParameter",
-          "operator",
-          "regexp"
+          "selfParameter",
+          "clsParameter"
         ],
         "tokenModifiers": [
+          "declaration",
           "definition",
           "readonly",
+          "static",
           "async",
-          "documentation"
+          "defaultLibrary",
+          "builtin",
+          "classMember",
+          "parameter"
         ]
       },
       "range": true,
