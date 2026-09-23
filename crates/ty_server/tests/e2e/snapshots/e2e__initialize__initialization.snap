@@ -83,7 +83,8 @@ expression: initialization_result
           "keyword",
           "decorator",
           "selfParameter",
-          "clsParameter"
+          "clsParameter",
+          "string"
         ],
         "tokenModifiers": [
           "declaration",

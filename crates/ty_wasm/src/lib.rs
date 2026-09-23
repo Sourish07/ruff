@@ -1575,6 +1575,7 @@ pub enum SemanticTokenKind {
     Decorator,
     SelfParameter,
     ClsParameter,
+    String,
 }
 
 impl From<ty_ide::SemanticTokenType> for SemanticTokenKind {
@@ -1595,6 +1596,7 @@ impl From<ty_ide::SemanticTokenType> for SemanticTokenKind {
             ty_ide::SemanticTokenType::Decorator => Self::Decorator,
             ty_ide::SemanticTokenType::SelfParameter => Self::SelfParameter,
             ty_ide::SemanticTokenType::ClsParameter => Self::ClsParameter,
+            ty_ide::SemanticTokenType::String => Self::String,
         }
     }
 }
