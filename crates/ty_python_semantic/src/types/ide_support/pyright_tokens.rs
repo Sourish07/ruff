@@ -1506,7 +1506,10 @@ fn keyword_argument<'db>(
     };
     // The keywords of a function only resolve to its parameters. ty's synthesized methods (the
     // `_replace` of a named tuple) point them to the fields instead.
-    if matches!(callee, Some(Type::FunctionLiteral(_) | Type::BoundMethod(_))) {
+    if matches!(
+        callee,
+        Some(Type::FunctionLiteral(_) | Type::BoundMethod(_))
+    ) {
         definitions.retain(|definition| {
             definition.definition().is_some_and(|definition| {
                 matches!(definition.kind(db), DefinitionKind::Parameter(_))
@@ -2366,7 +2369,10 @@ pub fn pyright_symbol_definition<'db>(
 }
 
 /// The declared type of an annotated variable or parameter.
-pub fn pyright_declared_type<'db>(db: &'db dyn Db, definition: Definition<'db>) -> Option<Type<'db>> {
+pub fn pyright_declared_type<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<Type<'db>> {
     inferred_declaration(db, definition)
         .declared()
         .map(|declared| declared.inner_type())
@@ -2425,9 +2431,11 @@ pub fn pyright_call_return_type<'db>(
             }
             Some(function.signature(db).overloads.first()?.return_ty)
         }
-        Type::ClassLiteral(_) | Type::GenericAlias(_) => {
-            Some(callee.to_instance(db, &model.program_environment())?.into_inner())
-        }
+        Type::ClassLiteral(_) | Type::GenericAlias(_) => Some(
+            callee
+                .to_instance(db, &model.program_environment())?
+                .into_inner(),
+        ),
         _ => None,
     }
 }
@@ -2441,6 +2449,21 @@ pub fn pyright_widen_literal<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> 
         }
         _ => ty,
     }
+}
+
+/// Whether `ty` is an instance of a class that defines `__call__` (not counting `object`), such as
+/// a `torch.nn.Module`.
+pub fn pyright_is_callable_instance<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> bool {
+    matches!(ty, Type::NominalInstance(_))
+        && !ty
+            .member_lookup_with_policy(
+                model.db(),
+                &model.program_environment(),
+                "__call__",
+                MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
+            )
+            .place
+            .is_undefined()
 }
 
 /// The union of `elements`, the way pyright combines the types of a symbol's declarations.

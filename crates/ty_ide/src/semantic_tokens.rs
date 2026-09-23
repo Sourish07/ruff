@@ -46,13 +46,14 @@ use ty_python_semantic::types::ide_support::pyright_tokens::{
     pyright_declarations, pyright_declared_type, pyright_definition_type,
     pyright_function_definition_is_static, pyright_functional_named_tuple_field,
     pyright_has_declared_type, pyright_hasattr_receiver, pyright_inferred_call_type,
-    pyright_is_dynamic_class_object, pyright_is_explicit_any, pyright_is_generic_class_subscript,
-    pyright_is_in_typing_stub, pyright_is_narrowed_not_none, pyright_is_pseudo_generic_attribute,
-    pyright_is_type_alias_declaration, pyright_is_type_form_variable_type,
-    pyright_keyword_arguments, pyright_member_type, pyright_method_accessor,
-    pyright_narrowed_receiver_member_type, pyright_parameter_is_method_receiver, pyright_receiver,
-    pyright_slot_type, pyright_symbol_declarations, pyright_symbol_definition, pyright_type,
-    pyright_undecorated_type, pyright_union, pyright_widen_literal,
+    pyright_is_callable_instance, pyright_is_dynamic_class_object, pyright_is_explicit_any,
+    pyright_is_generic_class_subscript, pyright_is_in_typing_stub, pyright_is_narrowed_not_none,
+    pyright_is_pseudo_generic_attribute, pyright_is_type_alias_declaration,
+    pyright_is_type_form_variable_type, pyright_keyword_arguments, pyright_member_type,
+    pyright_method_accessor, pyright_narrowed_receiver_member_type,
+    pyright_parameter_is_method_receiver, pyright_receiver, pyright_slot_type,
+    pyright_symbol_declarations, pyright_symbol_definition, pyright_type, pyright_undecorated_type,
+    pyright_union, pyright_widen_literal,
 };
 use ty_python_semantic::types::ide_support::{
     CallArgumentForm, UnreachableRange, call_argument_forms, unreachable_ranges,
@@ -162,6 +163,12 @@ bitflags! {
         const CLASS_MEMBER = 1 << 7;
         /// A parameter, or the name of a keyword argument, regardless of its token type.
         const PARAMETER = 1 << 8;
+        /// An attribute whose value can be called, such as a `torch.nn.Module` stored on `self`.
+        /// basedpyright has no such modifier.
+        const CALLABLE = 1 << 9;
+        /// A "magic" (dunder) method or function, such as `__init__`. basedpyright has no such
+        /// modifier.
+        const MAGIC = 1 << 10;
     }
 }
 
@@ -184,6 +191,8 @@ impl SemanticTokenModifier {
             "builtin",
             "classMember",
             "parameter",
+            "callable",
+            "magic",
         ]
     }
 }
@@ -237,6 +246,19 @@ pub fn semantic_tokens(
     visitor.visit_body(parsed.suite());
 
     let mut tokens = visitor.tokens;
+    let source = source_text(db, file.file(db));
+    for token in &mut tokens {
+        let name = &source[token.range];
+        if matches!(
+            token.token_type,
+            SemanticTokenType::Method | SemanticTokenType::Function
+        ) && name.len() > 4
+            && name.starts_with("__")
+            && name.ends_with("__")
+        {
+            token.modifiers |= SemanticTokenModifier::MAGIC;
+        }
+    }
     // Declaration tokens are emitted before the decorators that precede them. A stable sort keeps
     // tokens that start at the same offset in the order they were emitted.
     tokens.sort_by_key(SemanticToken::start);
@@ -589,8 +611,26 @@ impl<'db> SemanticTokenVisitor<'db> {
         ))
     }
 
-    /// pyright's `_visitNameWithDeclarations`.
+    /// Classifies a name like pyright (see [`Self::pyright_classify_name`]), and adds the
+    /// modifiers that only ty has.
     fn classify_name(
+        &self,
+        context: NameContext<'db>,
+        declarations: &[PyrightDeclaration<'db>],
+        name_type: NameType<'db>,
+    ) -> Classification {
+        let (token_type, mut modifiers) =
+            self.pyright_classify_name(context, declarations, name_type)?;
+        if token_type == SemanticTokenType::Property
+            && name_type.is_some_and(|(ty, _)| pyright_is_callable_instance(self.model, ty))
+        {
+            modifiers |= SemanticTokenModifier::CALLABLE;
+        }
+        Some((token_type, modifiers))
+    }
+
+    /// pyright's `_visitNameWithDeclarations`.
+    fn pyright_classify_name(
         &self,
         context: NameContext<'db>,
         declarations: &[PyrightDeclaration<'db>],
@@ -4871,7 +4911,7 @@ class BoundedContainer[T: int, U = str]:
         "Container" @ 504..513: Class [declaration]
         "T" @ 514..515: TypeParameter
         "U" @ 517..518: TypeParameter
-        "__init__" @ 529..537: Method [declaration, classMember]
+        "__init__" @ 529..537: Method [declaration, classMember, magic]
         "self" @ 538..542: SelfParameter [declaration, parameter]
         "value1" @ 544..550: Parameter [declaration, parameter]
         "T" @ 552..553: TypeParameter
@@ -5205,7 +5245,7 @@ class C:
         "typing" @ 6..12: Namespace
         "Self" @ 20..24: Class
         "C" @ 33..34: Class [declaration]
-        "__init__" @ 44..52: Method [declaration, classMember]
+        "__init__" @ 44..52: Method [declaration, classMember, magic]
         "self" @ 53..57: SelfParameter [declaration, parameter]
         "Self" @ 59..63: Type
         "self" @ 74..78: SelfParameter [parameter]
@@ -5594,7 +5634,7 @@ class Wrapper:
 
         assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
         "Wrapper" @ 7..14: Class [declaration]
-        "__init__" @ 24..32: Method [declaration, classMember]
+        "__init__" @ 24..32: Method [declaration, classMember, magic]
         "self" @ 33..37: SelfParameter [declaration, parameter]
         "value" @ 39..44: Parameter [declaration, parameter]
         "label" @ 46..51: Parameter [declaration, parameter]
@@ -5639,16 +5679,16 @@ item.value
         "Base" @ 7..11: Class [declaration]
         "value" @ 17..22: Property [static, classMember]
         "str" @ 24..27: Class [defaultLibrary, builtin]
-        "__init__" @ 37..45: Method [declaration, classMember]
+        "__init__" @ 37..45: Method [declaration, classMember, magic]
         "self" @ 46..50: SelfParameter [declaration, parameter]
         "self" @ 69..73: SelfParameter [parameter]
         "value" @ 74..79: Property [static, classMember]
         "Derived" @ 93..100: Class [declaration]
         "Base" @ 101..105: Class
-        "__init__" @ 116..124: Method [declaration, classMember]
+        "__init__" @ 116..124: Method [declaration, classMember, magic]
         "self" @ 125..129: SelfParameter [declaration, parameter]
         "super" @ 148..153: Class [defaultLibrary, builtin]
-        "__init__" @ 156..164: Method [classMember]
+        "__init__" @ 156..164: Method [classMember, magic]
         "self" @ 175..179: SelfParameter [parameter]
         "value" @ 180..185: Property [static, classMember]
         "item" @ 200..204: Variable
@@ -5829,7 +5869,7 @@ C().B
         assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
         "C" @ 7..8: Class [declaration]
         "__slots__" @ 14..23: Property [static, classMember]
-        "__init__" @ 46..54: Method [declaration, classMember]
+        "__init__" @ 46..54: Method [declaration, classMember, magic]
         "self" @ 55..59: SelfParameter [declaration, parameter]
         "self" @ 70..74: SelfParameter [parameter]
         "a" @ 75..76: Property [static, classMember]
@@ -5867,9 +5907,9 @@ with holder.inner.lock:
 
         assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
         "Lock" @ 7..11: Class [declaration]
-        "__enter__" @ 21..30: Method [declaration, classMember]
+        "__enter__" @ 21..30: Method [declaration, classMember, magic]
         "self" @ 31..35: SelfParameter [declaration, parameter]
-        "__exit__" @ 50..58: Method [declaration, classMember]
+        "__exit__" @ 50..58: Method [declaration, classMember, magic]
         "self" @ 59..63: SelfParameter [declaration, parameter]
         "args" @ 66..70: Parameter [declaration, parameter]
         "Holder" @ 84..90: Class [declaration]
@@ -6387,7 +6427,7 @@ Derived().length
 
         assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
         "Base" @ 7..11: Class [declaration]
-        "__init__" @ 21..29: Method [declaration, classMember]
+        "__init__" @ 21..29: Method [declaration, classMember, magic]
         "self" @ 30..34: SelfParameter [declaration, parameter]
         "self" @ 45..49: SelfParameter [parameter]
         "base_attr" @ 50..59: Property [classMember]
@@ -6449,7 +6489,7 @@ class D:
         "self" @ 104..108: SelfParameter [declaration, parameter]
         "self" @ 119..123: SelfParameter [parameter]
         "undeclared" @ 124..134: Property [classMember]
-        "__getattr__" @ 144..155: Method [declaration, classMember]
+        "__getattr__" @ 144..155: Method [declaration, classMember, magic]
         "self" @ 156..160: SelfParameter [declaration, parameter]
         "name" @ 162..166: Parameter [declaration, parameter]
         "str" @ 168..171: Class [defaultLibrary, builtin]
@@ -6487,6 +6527,53 @@ def f(x: Float[int, "batch seq"], y: Annotated[int, "meta", 3]) -> None: ...
         "Annotated" @ 107..116: Class
         "int" @ 117..120: Class [defaultLibrary, builtin]
         "\"meta\"" @ 122..128: String
+        "#);
+    }
+
+    #[test]
+    fn callable_attributes_and_magic_methods() {
+        let test = SemanticTokenTest::new(
+            r#"
+class Layer:
+    def __call__(self, x: int) -> int:
+        return x
+
+class Model:
+    def __init__(self):
+        self.layer = Layer()
+        self.size = 1
+
+    def forward(self, x: int) -> int:
+        return self.layer(x) + self.size
+"#,
+        );
+
+        assert_snapshot!(test.to_snapshot(&test.highlight_file()), @r#"
+        "Layer" @ 7..12: Class [declaration]
+        "__call__" @ 22..30: Method [declaration, classMember, magic]
+        "self" @ 31..35: SelfParameter [declaration, parameter]
+        "x" @ 37..38: Parameter [declaration, parameter]
+        "int" @ 40..43: Class [defaultLibrary, builtin]
+        "int" @ 48..51: Class [defaultLibrary, builtin]
+        "x" @ 68..69: Parameter [parameter]
+        "Model" @ 77..82: Class [declaration]
+        "__init__" @ 92..100: Method [declaration, classMember, magic]
+        "self" @ 101..105: SelfParameter [declaration, parameter]
+        "self" @ 116..120: SelfParameter [parameter]
+        "layer" @ 121..126: Property [classMember, callable]
+        "Layer" @ 129..134: Class
+        "self" @ 145..149: SelfParameter [parameter]
+        "size" @ 150..154: Property [classMember]
+        "forward" @ 168..175: Method [declaration, classMember]
+        "self" @ 176..180: SelfParameter [declaration, parameter]
+        "x" @ 182..183: Parameter [declaration, parameter]
+        "int" @ 185..188: Class [defaultLibrary, builtin]
+        "int" @ 193..196: Class [defaultLibrary, builtin]
+        "self" @ 213..217: SelfParameter [parameter]
+        "layer" @ 218..223: Property [classMember, callable]
+        "x" @ 224..225: Parameter [parameter]
+        "self" @ 229..233: SelfParameter [parameter]
+        "size" @ 234..238: Property [classMember]
         "#);
     }
 
