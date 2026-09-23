@@ -17,11 +17,18 @@
 
 mod reachability;
 
+use reachability::StaticConditions;
+
+use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 
+use ruff_db::files::File;
+use rustc_hash::FxHashMap;
+
 use bitflags::bitflags;
 use ruff_db::parsed::parsed_module;
+use ruff_db::source::source_text;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::source_order::{
     SourceOrderVisitor, TraversalSignal, walk_expr, walk_pattern, walk_stmt,
@@ -29,21 +36,23 @@ use ruff_python_ast::visitor::source_order::{
 use ruff_python_ast::{self as ast, AnyNodeRef, Expr, ExprContext, ExprRef, Stmt, TypeParam};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
-use ty_python_core::scope::{FileScopeId, ScopeKind};
+use ty_python_core::place::ScopedPlaceId;
+use ty_python_core::scope::{FileScopeId, ScopeId, ScopeKind};
 use ty_python_core::{ProgramFile, semantic_index};
 use ty_python_semantic::types::ide_support::pyright_tokens::{
     PyrightAccessor, PyrightDeclaration, PyrightDeclarationKind, PyrightFunction,
     PyrightKeywordArgument, PyrightType, PyrightTypeCategory, PyrightTypeContext,
-    pyright_attribute_declarations, pyright_declaration, pyright_declarations,
-    pyright_definition_type, pyright_function_definition_is_static,
-    pyright_functional_named_tuple_field, pyright_has_declared_type, pyright_hasattr_receiver,
-    pyright_inferred_call_type, pyright_is_dynamic_class_object,
-    pyright_is_generic_class_subscript, pyright_is_narrowed_not_none,
-    pyright_is_pseudo_generic_attribute, pyright_is_type_alias_declaration,
+    pyright_attribute_declarations, pyright_call_return_type, pyright_declaration,
+    pyright_declarations, pyright_declared_type, pyright_definition_type,
+    pyright_function_definition_is_static, pyright_functional_named_tuple_field,
+    pyright_has_declared_type, pyright_hasattr_receiver, pyright_inferred_call_type,
+    pyright_is_dynamic_class_object, pyright_is_explicit_any, pyright_is_generic_class_subscript,
+    pyright_is_in_typing_stub, pyright_is_narrowed_not_none, pyright_is_pseudo_generic_attribute,
+    pyright_is_type_alias_declaration, pyright_is_type_form_variable_type,
     pyright_keyword_arguments, pyright_member_type, pyright_method_accessor,
     pyright_narrowed_receiver_member_type, pyright_parameter_is_method_receiver, pyright_receiver,
     pyright_slot_type, pyright_symbol_declarations, pyright_symbol_definition, pyright_type,
-    pyright_undecorated_type, pyright_union,
+    pyright_undecorated_type, pyright_union, pyright_widen_literal,
 };
 use ty_python_semantic::types::ide_support::{
     CallArgumentForm, UnreachableRange, call_argument_forms, unreachable_ranges,
@@ -270,15 +279,55 @@ bitflags! {
         /// Inside an expression that pyright's `isWriteAccess` counts as written: an assignment,
         /// `for` or `del` target, or a `with` item, except for the receivers of attributes.
         const WRITE = 1 << 3;
-        /// Inside a branch of a conditional expression that pyright doesn't evaluate because its
-        /// condition is statically known.
+        /// Inside a branch of a conditional expression that pyright's binder skips because its
+        /// condition is statically known: names have no declarations and no type.
         const SKIPPED_BRANCH = 1 << 4;
-        /// The receiver of an attribute or the callee of a call in a skipped branch, which
-        /// pyright still evaluates.
-        const SKIPPED_BASE = 1 << 5;
-        /// Inside the body of a lambda in a skipped branch: names have declarations but no type.
-        const UNTYPED = 1 << 6;
+        /// Inside an expression that pyright doesn't evaluate, but binds: a branch of a
+        /// conditional expression in code that is unreachable after type analysis, or the body of
+        /// a lambda in a skipped branch. Names have declarations but no type.
+        const UNTYPED = 1 << 5;
+        /// In a skipped or untyped expression, the receiver of an attribute, the callee of a call
+        /// or the condition of a conditional expression, which pyright evaluates on its own.
+        const BASE = 1 << 6;
+        /// In a skipped or untyped expression, inside the arguments of a call that pyright
+        /// doesn't evaluate, so that nothing in them is evaluated.
+        const OPAQUE = 1 << 7;
     }
+}
+
+impl VisitFlags {
+    /// Whether pyright doesn't evaluate the types of expressions here.
+    fn is_unevaluated(self) -> bool {
+        self.intersects(Self::SKIPPED_BRANCH | Self::UNTYPED)
+    }
+
+    /// The flags for a receiver, callee or condition, which pyright evaluates on its own in an
+    /// expression that it doesn't evaluate otherwise.
+    fn base(self) -> Self {
+        if self.is_unevaluated() && !self.contains(Self::OPAQUE) {
+            self | Self::BASE
+        } else {
+            self - Self::BASE
+        }
+    }
+}
+
+/// Whether one of `ranges` (sorted by start and not overlapping) contains `range`.
+fn ranges_contain(ranges: &[TextRange], range: TextRange) -> bool {
+    let index = ranges.partition_point(|candidate| candidate.end() <= range.start());
+    ranges
+        .get(index)
+        .is_some_and(|candidate| candidate.contains_range(range))
+}
+
+/// How pyright evaluates a branch of a conditional expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchMode {
+    Evaluated,
+    /// The binder skips the branch because the condition is statically known.
+    Skipped,
+    /// The branch is bound, but not evaluated.
+    Untyped,
 }
 
 /// How pyright and ty treat the code at a location.
@@ -292,6 +341,24 @@ enum Reachability {
     Unbound,
 }
 
+/// Facts that many names of a file share, computed on demand.
+#[derive(Default)]
+struct Caches<'db> {
+    /// The ranges that pyright's binder doesn't bind in other files.
+    other_files_unbound: FxHashMap<File, Rc<[TextRange]>>,
+    /// The declarations of each symbol, in pyright's order.
+    symbol_declarations: FxHashMap<(ScopeId<'db>, ScopedPlaceId), Rc<[PyrightDeclaration<'db>]>>,
+    /// The effective types of names in unreachable code, by the first definition of the symbol,
+    /// whether the name is bound, and the number of the symbol's definitions that count.
+    effective_types: FxHashMap<(Definition<'db>, bool, usize), Option<Type<'db>>>,
+    /// The types of attributes and calls in unreachable code.
+    unevaluated_types: FxHashMap<TextRange, Option<Type<'db>>>,
+    /// The declarations for lists of definitions.
+    declarations: FxHashMap<Vec<ResolvedDefinition<'db>>, Rc<[PyrightDeclaration<'db>]>>,
+    /// The declarations of members, by receiver and member name.
+    attribute_declarations: FxHashMap<(Type<'db>, Name), Rc<[PyrightDeclaration<'db>]>>,
+}
+
 /// AST visitor that collects semantic tokens.
 struct SemanticTokenVisitor<'db> {
     model: &'db SemanticModel<'db>,
@@ -301,6 +368,8 @@ struct SemanticTokenVisitor<'db> {
     unreachable: &'db [UnreachableRange],
     /// The ranges that pyright's binder doesn't bind, sorted by start.
     unbound: Rc<[TextRange]>,
+    conditions: Rc<StaticConditions>,
+    caches: RefCell<Caches<'db>>,
     /// The parameters of the lambdas that enclose the visited node inside a string annotation.
     /// ty has no definitions for the nodes of a string annotation, so the visitor resolves these
     /// names itself.
@@ -315,14 +384,30 @@ impl<'db> SemanticTokenVisitor<'db> {
         let db = model.db();
         let file = model.program_file();
         let parsed = parsed_module(db, file.python_file(db)).load(db);
-        let unbound = reachability::unbound_ranges(parsed.suite(), file.python_version(db));
-        Self::with_unbound(model, range_filter, unbound.into())
+        let suite = parsed.suite();
+        let conditions = StaticConditions::new(suite, file.python_version(db));
+        let unbound = match source_text(db, file.file(db)).as_notebook() {
+            // Pyright analyzes each cell of a notebook on its own, so a cell that stops (with
+            // `raise SystemExit`, for example) doesn't make the cells after it unreachable.
+            Some(notebook) => notebook
+                .cell_offsets()
+                .windows(2)
+                .flat_map(|cell| {
+                    let start = suite.partition_point(|statement| statement.start() < cell[0]);
+                    let end = suite.partition_point(|statement| statement.start() < cell[1]);
+                    reachability::unbound_ranges(&suite[start..end], &conditions)
+                })
+                .collect(),
+            None => reachability::unbound_ranges(suite, &conditions),
+        };
+        Self::with_reachability(model, range_filter, unbound.into(), Rc::new(conditions))
     }
 
-    fn with_unbound(
+    fn with_reachability(
         model: &'db SemanticModel<'db>,
         range_filter: Option<TextRange>,
         unbound: Rc<[TextRange]>,
+        conditions: Rc<StaticConditions>,
     ) -> Self {
         Self {
             model,
@@ -330,6 +415,8 @@ impl<'db> SemanticTokenVisitor<'db> {
             flags: VisitFlags::empty(),
             unreachable: unreachable_ranges(model.db(), model.program_file()),
             unbound,
+            conditions,
+            caches: RefCell::default(),
             string_lambda_parameters: Vec::new(),
             hasattr_names: Vec::new(),
             range_filter,
@@ -341,14 +428,7 @@ impl<'db> SemanticTokenVisitor<'db> {
     }
 
     fn reachability(&self, range: TextRange) -> Reachability {
-        let index = self
-            .unbound
-            .partition_point(|unbound| unbound.end() <= range.start());
-        if self
-            .unbound
-            .get(index)
-            .is_some_and(|unbound| unbound.contains_range(range))
-        {
+        if ranges_contain(&self.unbound, range) {
             return Reachability::Unbound;
         }
         let index = self
@@ -363,6 +443,31 @@ impl<'db> SemanticTokenVisitor<'db> {
         } else {
             Reachability::Reachable
         }
+    }
+
+    /// Whether `definition` is in this file's code that pyright's binder skips.
+    fn is_unbound_definition(&self, definition: Definition<'db>) -> bool {
+        let db = self.db();
+        let file = definition.file(db);
+        let parsed = parsed_module(db, definition.python_file(db)).load(db);
+        let range = definition.focus_range(db, &parsed).range();
+        if file == self.model.file() {
+            return ranges_contain(&self.unbound, range);
+        }
+        let unbound = self
+            .caches
+            .borrow_mut()
+            .other_files_unbound
+            .entry(file)
+            .or_insert_with(|| {
+                let conditions = StaticConditions::new(
+                    parsed.suite(),
+                    self.model.program_file().python_version(db),
+                );
+                reachability::unbound_ranges(parsed.suite(), &conditions).into()
+            })
+            .clone();
+        ranges_contain(&unbound, range)
     }
 
     fn is_outside_range_filter(&self, range: TextRange) -> bool {
@@ -415,11 +520,58 @@ impl<'db> SemanticTokenVisitor<'db> {
         Some((ty, pyright_type(self.model, ty, context)))
     }
 
+    /// The declarations of `definitions` that pyright sees: its binder skips statically
+    /// unreachable code in every file (the `else` of `if TYPE_CHECKING:`, for example).
     fn declarations(
         &self,
         definitions: &[ResolvedDefinition<'db>],
     ) -> Vec<PyrightDeclaration<'db>> {
-        pyright_declarations(self.model, definitions)
+        let definitions: Vec<ResolvedDefinition<'db>> = definitions
+            .iter()
+            .filter(|resolved| {
+                resolved
+                    .definition()
+                    .is_none_or(|definition| !self.is_unbound_definition(definition))
+            })
+            .cloned()
+            .collect();
+        if let Some(declarations) = self.caches.borrow().declarations.get(&definitions) {
+            return declarations.to_vec();
+        }
+        let declarations: Rc<[PyrightDeclaration<'db>]> =
+            pyright_declarations(self.model, &definitions).into();
+        self.caches
+            .borrow_mut()
+            .declarations
+            .insert(definitions, declarations.clone());
+        declarations.to_vec()
+    }
+
+    /// The declarations of the member `name` of `receiver` (see
+    /// [`pyright_attribute_declarations`]), without those in code that pyright's binder skips.
+    fn attribute_declarations(
+        &self,
+        receiver: Type<'db>,
+        name: &str,
+    ) -> Vec<PyrightDeclaration<'db>> {
+        let key = (receiver, Name::new(name));
+        if let Some(declarations) = self.caches.borrow().attribute_declarations.get(&key) {
+            return declarations.to_vec();
+        }
+        let declarations: Rc<[PyrightDeclaration<'db>]> =
+            pyright_attribute_declarations(self.model, receiver, name)
+                .into_iter()
+                .filter(|declaration| {
+                    declaration
+                        .definition
+                        .is_none_or(|definition| !self.is_unbound_definition(definition))
+                })
+                .collect();
+        self.caches
+            .borrow_mut()
+            .attribute_declarations
+            .insert(key, declarations.clone());
+        declarations.to_vec()
     }
 
     fn name_declarations(&self, name: &str, node: AnyNodeRef<'_>) -> Vec<PyrightDeclaration<'db>> {
@@ -966,7 +1118,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             return;
         }
         if self.flags.contains(VisitFlags::SKIPPED_BRANCH) {
-            if self.flags.contains(VisitFlags::SKIPPED_BASE) {
+            if self.flags.contains(VisitFlags::BASE) {
                 self.add_skipped_base(name.range(), NameContext::new(), ExprRef::Name(name));
             }
             return;
@@ -974,10 +1126,11 @@ impl<'db> SemanticTokenVisitor<'db> {
         if self.flags.contains(VisitFlags::UNTYPED) {
             let declarations = self.name_declarations(name.id.as_str(), name.into());
             // Pyright looks builtins up without code flow, so they keep their type.
-            let name_type = if !declarations.is_empty()
-                && declarations
-                    .iter()
-                    .all(|declaration| declaration.in_builtins_module)
+            let name_type = if self.flags.contains(VisitFlags::BASE)
+                || (!declarations.is_empty()
+                    && declarations
+                        .iter()
+                        .all(|declaration| declaration.in_builtins_module))
             {
                 self.name_type(
                     self.effective_name_type(name, true),
@@ -1009,14 +1162,16 @@ impl<'db> SemanticTokenVisitor<'db> {
             }
             Reachability::Reachable => {
                 let declarations = self.name_declarations(name.id.as_str(), name.into());
-                // Pyright declares `__spec__`, `__loader__` and `__builtins__` as `Any`.
-                if matches!(name.id.as_str(), "__spec__" | "__loader__" | "__builtins__")
-                    && declarations.iter().all(|declaration| {
-                        declaration.definition.is_none_or(|definition| {
-                            definition.file(self.db()) != self.model.file()
-                        })
-                    })
-                {
+                // Pyright declares `__spec__`, `__loader__` and `__builtins__` as `Any`, and
+                // `__debug__` is a keyword constant for it.
+                if matches!(
+                    name.id.as_str(),
+                    "__spec__" | "__loader__" | "__builtins__" | "__debug__"
+                ) && declarations.iter().all(|declaration| {
+                    declaration
+                        .definition
+                        .is_none_or(|definition| definition.file(self.db()) != self.model.file())
+                }) {
                     return;
                 }
                 let name_type =
@@ -1059,12 +1214,30 @@ impl<'db> SemanticTokenVisitor<'db> {
                 ) if self.flags.contains(VisitFlags::TYPE_FORM) => Some(callable),
                 (bound, inferred) => bound.or(inferred),
             }
+            .map(|ty| {
+                if self.flags.contains(VisitFlags::TYPE_FORM)
+                    && !self.is_valid_in_type_form(declarations, Some(ty))
+                {
+                    Type::unknown()
+                } else {
+                    ty
+                }
+            })
         } else {
+            let declared = self.declared_variable_type(declarations);
             match name.inferred_type(self.model) {
                 // ty narrows a name that an enclosing `hasattr()` check rules out to `Never`
                 // (`if not hasattr(self, "x")` where the class assigns `self.x`), while pyright's
                 // `hasattr()` doesn't narrow.
                 Some(Type::Never) if self.hasattr_names.contains(&name.id) => bound_type(),
+                // Pyright doesn't narrow a variable declared as `Any` on assignment, and keeps
+                // the declared type of other variables when the assigned value is `Any`.
+                _ if name.ctx.is_store() && declared.is_some_and(pyright_is_explicit_any) => {
+                    declared
+                }
+                Some(inferred) if pyright_is_explicit_any(inferred) && declared.is_some() => {
+                    declared
+                }
                 inferred => inferred.or_else(bound_type),
             }
         }
@@ -1088,6 +1261,99 @@ impl<'db> SemanticTokenVisitor<'db> {
         let definition = definitions.first()?.definition()?;
         matches!(definition.kind(self.db()), DefinitionKind::Import(_))
             .then_some((SemanticTokenType::Namespace, SemanticTokenModifier::empty()))
+    }
+
+    /// The declarations of the symbol that `definition` binds (see [`pyright_symbol_declarations`]).
+    fn symbol_declarations(&self, definition: Definition<'db>) -> Rc<[PyrightDeclaration<'db>]> {
+        let db = self.db();
+        let key = (definition.scope(db), definition.place(db));
+        if let Some(declarations) = self.caches.borrow().symbol_declarations.get(&key) {
+            return declarations.clone();
+        }
+        let declarations: Rc<[PyrightDeclaration<'db>]> =
+            pyright_symbol_declarations(self.model, definition).into();
+        self.caches
+            .borrow_mut()
+            .symbol_declarations
+            .insert(key, declarations.clone());
+        declarations
+    }
+
+    /// The effective type of a symbol with `declarations`, without code flow: the declared type of
+    /// the last declaration that has one, or the union of the inferred types of all of them.
+    fn declarations_effective_type(
+        &self,
+        declarations: &[PyrightDeclaration<'db>],
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        if let Some(definition) = declarations
+            .iter()
+            .filter(|declaration| declaration.has_declared_type)
+            .filter_map(|declaration| declaration.definition)
+            .next_back()
+        {
+            return pyright_definition_type(db, definition);
+        }
+        let elements: Vec<Type<'db>> = declarations
+            .iter()
+            .filter_map(|declaration| declaration.definition)
+            .filter_map(|definition| self.inferred_definition_type(definition))
+            .collect();
+        (!elements.is_empty()).then(|| pyright_union(self.model, elements))
+    }
+
+    /// The declared type of an annotated variable or parameter among `declarations`.
+    fn declared_variable_type(
+        &self,
+        declarations: &[PyrightDeclaration<'db>],
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+        declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.has_declared_type
+                    && matches!(
+                        declaration.kind,
+                        PyrightDeclarationKind::Variable | PyrightDeclarationKind::Parameter
+                    )
+            })
+            .filter_map(|declaration| declaration.definition)
+            .next_back()
+            .and_then(|definition| pyright_declared_type(db, definition))
+    }
+
+    /// Whether pyright accepts a name with `declarations` and type `ty` in a type expression.
+    /// Variables and parameters are only valid there if they are type aliases, type variables, or
+    /// classes created by calling `NewType`, `NamedTuple` and the like; pyright evaluates others
+    /// to an unknown type.
+    fn is_valid_in_type_form(
+        &self,
+        declarations: &[PyrightDeclaration<'db>],
+        ty: Option<Type<'db>>,
+    ) -> bool {
+        let db = self.db();
+        let is_variable = |declaration: &PyrightDeclaration<'db>| {
+            matches!(
+                declaration.kind,
+                PyrightDeclarationKind::Variable | PyrightDeclarationKind::Parameter
+            ) && declaration
+                .definition
+                .is_some_and(|definition| !pyright_is_in_typing_stub(db, definition))
+        };
+        // ty resolves an import through every branch of the imported module, while pyright only
+        // sees the branches that its binder doesn't skip (`if TYPE_CHECKING:` ... `else:` ...). A
+        // class or special form among the declarations comes from such a branch.
+        if declarations.is_empty() || !declarations.iter().all(is_variable) {
+            return true;
+        }
+        if declarations.iter().all(|declaration| {
+            declaration
+                .definition
+                .is_some_and(|definition| self.is_type_alias_definition(definition))
+        }) {
+            return true;
+        }
+        ty.is_some_and(pyright_is_type_form_variable_type)
     }
 
     /// The execution scope of a scope, which is how pyright scopes code flow: class bodies and
@@ -1136,7 +1402,8 @@ impl<'db> SemanticTokenVisitor<'db> {
                 && Some(self.execution_scope(definition.file_scope(db))) == use_scope
         };
         let parsed = parsed_module(db, first.python_file(db)).load(db);
-        let definitions: Vec<Definition<'db>> = pyright_symbol_declarations(self.model, first)
+        let definitions: Vec<Definition<'db>> = self
+            .symbol_declarations(first)
             .iter()
             .filter_map(|declaration| declaration.definition)
             // Pyright doesn't bind the declarations in code that its binder skips.
@@ -1163,7 +1430,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             return last.and_then(|definition| pyright_definition_type(db, *definition));
         }
 
-        let elements: Vec<Type<'db>> = definitions
+        let counted: Vec<Definition<'db>> = definitions
             .iter()
             .copied()
             .filter(|definition| {
@@ -1178,9 +1445,20 @@ impl<'db> SemanticTokenVisitor<'db> {
                     || !is_same_scope(*definition)
                     || definition.focus_range(db, &parsed).start() < name.start()
             })
-            .filter_map(|definition| self.inferred_definition_type(definition))
             .collect();
-        (!elements.is_empty()).then(|| pyright_union(self.model, elements))
+        // Names in unreachable code are often used many times after the same definitions.
+        let key = (first, is_bound, counted.len());
+        if let Some(ty) = self.caches.borrow().effective_types.get(&key) {
+            return *ty;
+        }
+        let elements: Vec<Type<'db>> = counted
+            .into_iter()
+            .filter_map(|definition| self.inferred_definition_type(definition))
+            .map(|ty| pyright_widen_literal(self.model, ty))
+            .collect();
+        let ty = (!elements.is_empty()).then(|| pyright_union(self.model, elements));
+        self.caches.borrow_mut().effective_types.insert(key, ty);
+        ty
     }
 
     /// The type pyright infers for a definition without a declared type. An unannotated
@@ -1218,6 +1496,21 @@ impl<'db> SemanticTokenVisitor<'db> {
     /// The type of an expression in code where ty has no types: pyright's type without code-flow
     /// narrowing.
     fn unevaluated_expression_type(&self, expr: &Expr) -> Option<Type<'db>> {
+        if matches!(expr, Expr::Attribute(_) | Expr::Call(_)) {
+            if let Some(ty) = self.caches.borrow().unevaluated_types.get(&expr.range()) {
+                return *ty;
+            }
+            let ty = self.uncached_unevaluated_expression_type(expr);
+            self.caches
+                .borrow_mut()
+                .unevaluated_types
+                .insert(expr.range(), ty);
+            return ty;
+        }
+        self.uncached_unevaluated_expression_type(expr)
+    }
+
+    fn uncached_unevaluated_expression_type(&self, expr: &Expr) -> Option<Type<'db>> {
         match expr {
             Expr::Name(name) => {
                 let is_bound = self.reachability(name.range()) != Reachability::Unbound;
@@ -1226,6 +1519,10 @@ impl<'db> SemanticTokenVisitor<'db> {
             Expr::Attribute(attribute) => {
                 let receiver = self.unevaluated_expression_type(&attribute.value)?;
                 pyright_member_type(self.model, receiver, attribute.attr.as_str())
+            }
+            Expr::Call(call) => {
+                let callee = self.unevaluated_expression_type(&call.func)?;
+                pyright_call_return_type(self.model, callee)
             }
             _ => None,
         }
@@ -1273,25 +1570,25 @@ impl<'db> SemanticTokenVisitor<'db> {
                     receiver => pyright_member_type(self.model, receiver, attribute.attr.as_str()),
                 }
             }
+            ExprRef::Call(call) => match self.skipped_base_type((&*call.func).into())? {
+                Type::Never => Some(Type::Never),
+                callee => pyright_call_return_type(self.model, callee),
+            },
             _ => None,
         }
     }
 
     fn visit_attribute_expr(&mut self, attribute: &ast::ExprAttribute, has_type: bool) {
         let is_write = self.is_write(attribute.ctx);
-        // The receiver of an attribute is read, not written, and pyright evaluates it even in a
-        // skipped branch.
-        let mut receiver_flags = self.flags - VisitFlags::WRITE;
-        if self.flags.contains(VisitFlags::SKIPPED_BRANCH) {
-            receiver_flags |= VisitFlags::SKIPPED_BASE;
-        }
-        self.visit_expr_with_flags(&attribute.value, receiver_flags);
+        // The receiver of an attribute is read, not written, and pyright evaluates it even in an
+        // expression that it doesn't evaluate otherwise.
+        self.visit_expr_with_flags(&attribute.value, (self.flags - VisitFlags::WRITE).base());
 
         if attribute.attr.is_empty() {
             return;
         }
         if self.flags.contains(VisitFlags::SKIPPED_BRANCH) {
-            if self.flags.contains(VisitFlags::SKIPPED_BASE) {
+            if self.flags.contains(VisitFlags::BASE) {
                 let receiver = self.skipped_base_type((&*attribute.value).into());
                 let context = NameContext {
                     receiver,
@@ -1305,8 +1602,38 @@ impl<'db> SemanticTokenVisitor<'db> {
             }
             return;
         }
-        // Without a receiver type, pyright finds no declarations and no type.
         if self.flags.contains(VisitFlags::UNTYPED) {
+            // The member has declarations if pyright evaluates the receiver, but a type only if
+            // it evaluates the attribute itself.
+            let receiver = if self.flags.contains(VisitFlags::OPAQUE) {
+                None
+            } else {
+                self.unevaluated_expression_type(&attribute.value)
+            };
+            let declarations = receiver
+                .filter(|receiver| {
+                    !pyright_type(self.model, *receiver, PyrightTypeContext::Value)
+                        .is_any_or_unknown
+                })
+                .map(|receiver| self.attribute_declarations(receiver, attribute.attr.as_str()))
+                .unwrap_or_default();
+            let name_type = if self.flags.contains(VisitFlags::BASE) {
+                self.name_type(
+                    receiver.and_then(|receiver| {
+                        pyright_member_type(self.model, receiver, attribute.attr.as_str())
+                    }),
+                    PyrightTypeContext::Value,
+                )
+            } else {
+                None
+            };
+            let context = NameContext {
+                receiver,
+                is_write,
+                ..NameContext::new()
+            };
+            let classification = self.classify_name(context, &declarations, name_type);
+            self.add_classified(attribute.attr.range(), classification);
             return;
         }
 
@@ -1362,7 +1689,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             });
         let declarations = match receiver {
             Some(receiver) if has_member_declarations => {
-                pyright_attribute_declarations(self.model, receiver, name)
+                self.attribute_declarations(receiver, name)
             }
             _ => Vec::new(),
         };
@@ -1462,7 +1789,7 @@ impl<'db> SemanticTokenVisitor<'db> {
     /// The type of reading `name` through `receiver`, with the inferred return type of a property
     /// getter that has no return annotation.
     fn member_read_type(&self, receiver: Type<'db>, name: &str) -> Option<Type<'db>> {
-        let declarations = pyright_attribute_declarations(self.model, receiver, name);
+        let declarations = self.attribute_declarations(receiver, name);
         if let Some(declaration) = declarations.first()
             && declaration.kind == PyrightDeclarationKind::Function
             && let Some(definition) = declaration.definition
@@ -1504,6 +1831,14 @@ impl<'db> SemanticTokenVisitor<'db> {
             .intersects(VisitFlags::TYPE_FORM | VisitFlags::TYPE_ARGUMENT)
             && let Some(member) = pyright_member_type(self.model, receiver, name)
         {
+            // Module variables are only valid in a type expression if they are type aliases
+            // (see `is_valid_in_type_form`).
+            if self.flags.contains(VisitFlags::TYPE_FORM)
+                && matches!(receiver, Type::ModuleLiteral(_))
+                && !self.is_valid_in_type_form(declarations, Some(member))
+            {
+                return Some(Type::unknown());
+            }
             return Some(member);
         }
         // ty types every member of `type[Unknown]` as unknown, while pyright finds it on `type`.
@@ -1522,6 +1857,17 @@ impl<'db> SemanticTokenVisitor<'db> {
         let mut ty = attribute
             .inferred_type(self.model)
             .or_else(from_declaration);
+        // ty widens a function stored in a class attribute (`concat = "".join`) to a callable
+        // type without its definition, while pyright keeps the function.
+        if matches!(ty, Some(Type::Callable(_)))
+            && declarations
+                .first()
+                .is_some_and(PyrightDeclaration::is_variable)
+            && let Some(bound @ (Type::FunctionLiteral(_) | Type::BoundMethod(_))) =
+                from_declaration()
+        {
+            ty = Some(bound);
+        }
         // ty has no type for the members of a receiver that only pyright's return type inference
         // knows (see `receiver_type`).
         if attribute.ctx.is_load()
@@ -1542,21 +1888,29 @@ impl<'db> SemanticTokenVisitor<'db> {
                 Some(pyright_member_type(self.model, stripped, name).unwrap_or_else(Type::unknown))
             }
             // ty narrows an unknown receiver to `Unknown & F` (after `isinstance(x, F)`), and the
-            // attribute's type to `Unknown`; pyright narrows the receiver to `F`.
+            // attribute's type to `Unknown`; pyright narrows the receiver to `F`. Pyright also
+            // keeps the declared type of an attribute that ty narrowed to an assigned `Any`.
             ExprContext::Load => {
+                if is_declared
+                    && ty.is_some_and(pyright_is_explicit_any)
+                    && let Some(declared) = pyright_member_type(self.model, receiver, name)
+                {
+                    return Some(declared);
+                }
                 pyright_narrowed_receiver_member_type(self.model, receiver, name).or(ty)
             }
             // Pyright narrows the declared type of an assignment target to the assigned type,
             // but keeps the declared type where the value is `Any` or unknown
-            // (`t.name = namespace["name"]`). ty types the target as unknown where the assignment
-            // isn't allowed.
+            // (`t.name = namespace["name"]`), or where the declared type is `Any`. ty types the
+            // target as unknown where the assignment isn't allowed.
             ExprContext::Store => {
                 if is_declared
-                    && ty.is_none_or(|ty| {
-                        let ty = pyright_type(self.model, ty, PyrightTypeContext::Value);
-                        ty.is_any_or_unknown && !ty.is_special_form
-                    })
                     && let Some(declared) = pyright_member_type(self.model, receiver, name)
+                    && (pyright_is_explicit_any(declared)
+                        || ty.is_none_or(|ty| {
+                            let ty = pyright_type(self.model, ty, PyrightTypeContext::Value);
+                            ty.is_any_or_unknown && !ty.is_special_form
+                        }))
                 {
                     Some(declared)
                 } else {
@@ -1582,7 +1936,9 @@ impl<'db> SemanticTokenVisitor<'db> {
         call: &ast::ExprCall,
         argument: Option<PyrightKeywordArgument<'db>>,
     ) {
+        // An invalid keyword (`f(x.y=1)`) has an empty name.
         if let Some(name) = &keyword.arg
+            && !name.is_empty()
             && let Some(argument) = argument
         {
             let mut declarations = self.declarations(&argument.definitions);
@@ -1608,6 +1964,11 @@ impl<'db> SemanticTokenVisitor<'db> {
     /// Classifies a name that is bound by a definition without an expression node, such as an
     /// exception handler's `as` name or a match-pattern capture.
     fn visit_bound_identifier(&mut self, identifier: &ast::Identifier, ty: Option<Type<'db>>) {
+        // Pyright has neither a declaration nor a type for names bound in code that its binder
+        // skips.
+        if self.reachability(identifier.range()) == Reachability::Unbound {
+            return;
+        }
         let declarations =
             self.name_declarations(identifier.as_str(), AnyNodeRef::Identifier(identifier));
         let name_type = self.name_type(ty, PyrightTypeContext::StoreTarget);
@@ -1662,7 +2023,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             return;
         }
         let definition = function.definition(self.model);
-        let declarations = pyright_symbol_declarations(self.model, definition);
+        let declarations = self.symbol_declarations(definition);
         let own_declaration = declarations
             .iter()
             .find(|declaration| declaration.definition == Some(definition))
@@ -1694,7 +2055,7 @@ impl<'db> SemanticTokenVisitor<'db> {
             // Pyright has no declaration for a class that its binder skips.
             self.class_token_type(NameContext::new(), ty, &[], &mut modifiers, false, false)
         } else {
-            let declarations = pyright_symbol_declarations(self.model, definition);
+            let declarations = self.symbol_declarations(definition);
             self.class_token_type(
                 NameContext::new(),
                 ty,
@@ -1797,7 +2158,7 @@ impl<'db> SemanticTokenVisitor<'db> {
 
     /// The flags that carry over into any nested expression.
     fn inherited_flags(&self) -> VisitFlags {
-        self.flags & (VisitFlags::SKIPPED_BRANCH | VisitFlags::UNTYPED)
+        self.flags & (VisitFlags::SKIPPED_BRANCH | VisitFlags::UNTYPED | VisitFlags::OPAQUE)
     }
 
     fn visit_value(&mut self, expr: &Expr) {
@@ -1823,11 +2184,13 @@ impl<'db> SemanticTokenVisitor<'db> {
     }
 
     fn visit_type_param_name(&mut self, type_param: &TypeParam) {
-        self.add_token(
-            type_param.name().range(),
-            SemanticTokenType::TypeParameter,
-            SemanticTokenModifier::empty(),
-        );
+        if self.reachability(type_param.range()) != Reachability::Unbound {
+            self.add_token(
+                type_param.name().range(),
+                SemanticTokenType::TypeParameter,
+                SemanticTokenModifier::empty(),
+            );
+        }
         match type_param {
             TypeParam::TypeVar(type_var) => {
                 if let Some(bound) = &type_var.bound {
@@ -1854,6 +2217,7 @@ impl<'db> SemanticTokenVisitor<'db> {
         // Class-header keywords have no declarations. Pyright records the argument's type for
         // keywords that `__init_subclass__` accepts, but never for `metaclass`.
         if let Some(name) = &keyword.arg
+            && !name.is_empty()
             && name.as_str() != "metaclass"
         {
             let name_type = self.name_type(
@@ -1876,11 +2240,14 @@ impl<'db> SemanticTokenVisitor<'db> {
         let Expr::Name(name) = target else {
             return false;
         };
+        semantic_index(self.db(), self.model.program_file())
+            .try_definition(name)
+            .is_some_and(|definition| self.is_type_alias_definition(definition))
+    }
+
+    /// Whether pyright treats `definition` as a type alias (see [`Self::is_type_alias_target`]).
+    fn is_type_alias_definition(&self, definition: Definition<'db>) -> bool {
         let db = self.db();
-        let Some(definition) = semantic_index(db, self.model.program_file()).try_definition(name)
-        else {
-            return false;
-        };
         pyright_is_type_alias_declaration(db, definition)
             && pyright_definition_type(db, definition).is_some_and(|ty| {
                 let ty = pyright_type(self.model, ty, PyrightTypeContext::TypeArgument);
@@ -1889,28 +2256,41 @@ impl<'db> SemanticTokenVisitor<'db> {
             })
     }
 
-    /// Which branches of a conditional expression pyright doesn't evaluate.
-    fn skipped_branches(&self, if_expr: &ast::ExprIf) -> (bool, bool) {
-        // In code that pyright finds unreachable, it evaluates neither branch.
-        if self.reachability(if_expr.range()) != Reachability::Reachable {
-            return (true, true);
+    /// How pyright evaluates the two branches of a conditional expression.
+    fn branch_modes(&self, if_expr: &ast::ExprIf) -> (BranchMode, BranchMode) {
+        match self.reachability(if_expr.range()) {
+            // Pyright doesn't evaluate either branch in code that it finds unreachable, but only
+            // the binder's unreachable code has no declarations.
+            Reachability::Unevaluated => return (BranchMode::Untyped, BranchMode::Untyped),
+            Reachability::Unbound => return (BranchMode::Skipped, BranchMode::Skipped),
+            Reachability::Reachable => {}
         }
-        let python_version = self.model.program_file().python_version(self.db());
-        let strict = reachability::strict_static_truthiness(&if_expr.test, python_version);
+        let strict = self.conditions.strict_truthiness(&if_expr.test);
         // The binder also marks a branch unreachable for other static conditions, which only
         // matters for branches that pyright checks for reachability on their own.
-        let binder = reachability::static_truthiness(&if_expr.test, python_version);
+        let binder = self.conditions.truthiness(&if_expr.test);
         let is_checked_on_its_own = |branch: &Expr| {
             matches!(
                 branch,
                 Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) | Expr::Lambda(_)
             )
         };
+        let mode = |skipped: bool| {
+            if skipped {
+                BranchMode::Skipped
+            } else {
+                BranchMode::Evaluated
+            }
+        };
         (
-            strict == Some(false)
-                || (binder == Some(false) && is_checked_on_its_own(&if_expr.body)),
-            strict == Some(true)
-                || (binder == Some(true) && is_checked_on_its_own(&if_expr.orelse)),
+            mode(
+                strict == Some(false)
+                    || (binder == Some(false) && is_checked_on_its_own(&if_expr.body)),
+            ),
+            mode(
+                strict == Some(true)
+                    || (binder == Some(true) && is_checked_on_its_own(&if_expr.orelse)),
+            ),
         )
     }
 }
@@ -1948,29 +2328,29 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
         if self.is_outside_range_filter(expr.range()) {
             return;
         }
-        // Only a receiver or a callee is evaluated on its own in a skipped branch.
-        if self.flags.contains(VisitFlags::SKIPPED_BASE)
+        // Only names, attributes and calls are evaluated on their own in an expression that
+        // pyright doesn't evaluate otherwise.
+        if self.flags.contains(VisitFlags::BASE)
             && !matches!(expr, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
         {
-            self.visit_expr_with_flags(expr, self.flags - VisitFlags::SKIPPED_BASE);
+            self.visit_expr_with_flags(expr, self.flags - VisitFlags::BASE);
             return;
         }
         match expr {
             Expr::Name(name) => self.visit_name_expr(name),
             Expr::Attribute(attribute) => self.visit_attribute_expr(attribute, true),
             Expr::If(if_expr) => {
-                let (skip_body, skip_else) = self.skipped_branches(if_expr);
+                let (body_mode, else_mode) = self.branch_modes(if_expr);
                 let flags = self.flags;
-                let branch_flags = |skip: bool| {
-                    if skip {
-                        flags | VisitFlags::SKIPPED_BRANCH
-                    } else {
-                        flags
-                    }
+                let branch_flags = |mode: BranchMode| match mode {
+                    BranchMode::Evaluated => flags,
+                    BranchMode::Skipped => flags | VisitFlags::SKIPPED_BRANCH,
+                    BranchMode::Untyped if flags.contains(VisitFlags::SKIPPED_BRANCH) => flags,
+                    BranchMode::Untyped => flags | VisitFlags::UNTYPED,
                 };
-                self.visit_expr_with_flags(&if_expr.body, branch_flags(skip_body));
-                self.visit_expr(&if_expr.test);
-                self.visit_expr_with_flags(&if_expr.orelse, branch_flags(skip_else));
+                self.visit_expr_with_flags(&if_expr.body, branch_flags(body_mode));
+                self.visit_expr_with_flags(&if_expr.test, flags.base());
+                self.visit_expr_with_flags(&if_expr.orelse, branch_flags(else_mode));
             }
             Expr::Lambda(lambda) if self.model.is_in_string_annotation() => {
                 self.visit_string_annotation_lambda(lambda);
@@ -1998,10 +2378,11 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                     && let Some((sub_ast, sub_model)) =
                         self.model.enter_string_annotation(string_expr)
                 {
-                    let mut sub_visitor = SemanticTokenVisitor::with_unbound(
+                    let mut sub_visitor = SemanticTokenVisitor::with_reachability(
                         &sub_model,
                         self.range_filter,
                         self.unbound.clone(),
+                        self.conditions.clone(),
                     );
                     sub_visitor.flags =
                         self.inherited_flags() | VisitFlags::TYPE_FORM | VisitFlags::PARSE_STRINGS;
@@ -2041,7 +2422,11 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                 let base = (self.reachability(subscript.range()) == Reachability::Reachable)
                     .then(|| subscript.value.inferred_type(self.model))
                     .flatten();
-                let inherited = self.flags & (VisitFlags::SKIPPED_BRANCH | VisitFlags::WRITE);
+                let inherited = self.flags
+                    & (VisitFlags::SKIPPED_BRANCH
+                        | VisitFlags::UNTYPED
+                        | VisitFlags::OPAQUE
+                        | VisitFlags::WRITE);
                 let flags = match base {
                     Some(Type::SpecialForm(_) | Type::KnownInstance(_)) => {
                         inherited | VisitFlags::TYPE_FORM
@@ -2049,30 +2434,32 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                     Some(base) if pyright_is_generic_class_subscript(self.model, base) => {
                         inherited | VisitFlags::TYPE_ARGUMENT
                     }
-                    _ => inherited | (self.flags & VisitFlags::UNTYPED),
+                    _ => inherited,
                 };
                 self.visit_expr_with_flags(&subscript.slice, flags);
             }
             Expr::Call(call) => {
-                // Pyright evaluates the callee even in a skipped branch.
-                let callee_flags = if self.flags.contains(VisitFlags::SKIPPED_BRANCH) {
-                    self.flags | VisitFlags::SKIPPED_BASE
+                // In an expression that pyright doesn't evaluate, it still evaluates the callee,
+                // and the whole call if the call is itself evaluated on its own (as a receiver,
+                // for example). Otherwise nothing in the arguments is evaluated.
+                self.visit_expr_with_flags(&call.func, self.flags.base());
+                let is_evaluated = !self.flags.is_unevaluated()
+                    || (self.flags.contains(VisitFlags::BASE)
+                        && !self.flags.contains(VisitFlags::OPAQUE));
+                let inherited = if is_evaluated {
+                    self.flags & VisitFlags::WRITE
                 } else {
-                    self.flags
+                    (self.flags
+                        & (VisitFlags::SKIPPED_BRANCH | VisitFlags::UNTYPED | VisitFlags::WRITE))
+                        | VisitFlags::OPAQUE
                 };
-                self.visit_expr_with_flags(&call.func, callee_flags);
-                let inherited = self.flags
-                    & (VisitFlags::SKIPPED_BRANCH | VisitFlags::WRITE | VisitFlags::UNTYPED);
-                // Keyword names in a skipped branch have no type.
-                let mut keyword_arguments = if inherited
-                    .intersects(VisitFlags::SKIPPED_BRANCH | VisitFlags::UNTYPED)
-                    || call.arguments.keywords.is_empty()
-                {
-                    Vec::new()
-                } else {
-                    pyright_keyword_arguments(self.model, call)
-                }
-                .into_iter();
+                let mut keyword_arguments =
+                    if !is_evaluated || call.arguments.keywords.is_empty() {
+                        Vec::new()
+                    } else {
+                        pyright_keyword_arguments(self.model, call)
+                    }
+                    .into_iter();
                 // Arguments such as the first argument of `cast` are type expressions, but pyright
                 // doesn't parse string arguments as annotations.
                 let argument_forms = call_argument_forms(self.model, call);
@@ -2163,11 +2550,13 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                 }
                 for keyword in &pattern_class.arguments.keywords {
                     // Pyright gives keyword names in class patterns the default variable token.
-                    self.add_token(
-                        keyword.attr.range(),
-                        SemanticTokenType::Variable,
-                        SemanticTokenModifier::empty(),
-                    );
+                    if self.reachability(keyword.range()) != Reachability::Unbound {
+                        self.add_token(
+                            keyword.attr.range(),
+                            SemanticTokenType::Variable,
+                            SemanticTokenModifier::empty(),
+                        );
+                    }
                     self.visit_pattern(&keyword.pattern);
                 }
             }
@@ -2262,11 +2651,14 @@ impl SemanticTokenVisitor<'_> {
                 self.visit_annotation(&type_alias.value);
             }
             Stmt::Import(import) => {
+                // Pyright has no declarations for the names that imports in code that its binder
+                // skips bind.
+                let is_bound = self.reachability(import.range()) != Reachability::Unbound;
                 for alias in &import.names {
                     self.visit_import_module_name(&alias.name);
                     // The alias of a module import is a namespace, even if the module doesn't
                     // resolve.
-                    if let Some(asname) = &alias.asname {
+                    if is_bound && let Some(asname) = &alias.asname {
                         self.add_token(
                             asname.range(),
                             SemanticTokenType::Namespace,
@@ -2279,8 +2671,14 @@ impl SemanticTokenVisitor<'_> {
                 if let Some(module) = &import.module {
                     self.visit_import_module_name(module);
                 }
+                // Pyright's binder records the names imported from `typing` even in code that it
+                // skips otherwise.
+                let is_bound = self.reachability(import.range()) != Reachability::Unbound
+                    || import.module.as_ref().is_some_and(|module| {
+                        matches!(module.as_str(), "typing" | "typing_extensions")
+                    });
                 for alias in &import.names {
-                    if alias.name.as_str() == "*" {
+                    if !is_bound || alias.name.as_str() == "*" {
                         continue;
                     }
                     let declarations = self.declarations(&definitions_for_imported_symbol(
@@ -2305,12 +2703,16 @@ impl SemanticTokenVisitor<'_> {
             }
             Stmt::Global(ast::StmtGlobal { names, .. })
             | Stmt::Nonlocal(ast::StmtNonlocal { names, .. }) => {
-                // Pyright records no type for these names; only their declarations count.
+                // Pyright gives these names the effective type of the symbol they refer to.
                 for identifier in names {
                     let declarations = self
                         .name_declarations(identifier.as_str(), AnyNodeRef::Identifier(identifier));
+                    let name_type = self.name_type(
+                        self.declarations_effective_type(&declarations),
+                        PyrightTypeContext::Value,
+                    );
                     let classification =
-                        self.classify_name(NameContext::new(), &declarations, None);
+                        self.classify_name(NameContext::new(), &declarations, name_type);
                     self.add_classified(identifier.range(), classification);
                 }
             }
@@ -5323,9 +5725,9 @@ y = 2
         "dataclass" @ 63..72: Decorator
         "Event" @ 79..84: Class [declaration]
         "date" @ 90..94: Property [static, classMember]
-        "date" @ 96..100: Class [static, classMember]
+        "date" @ 96..100: Variable
         "when" @ 105..109: Property [static, classMember]
-        "date" @ 111..115: Class [static, classMember]
+        "date" @ 111..115: Variable
         "y" @ 117..118: Variable
         "#);
     }
