@@ -1005,8 +1005,38 @@ pub fn pyright_narrowed_receiver_member_type<'db>(
         .ignore_possibly_undefined()
 }
 
-/// The type of reading `name` through `receiver`. Pyright gives an assignment target the
-/// member's declared type when the assigned value is `Any` or unknown.
+/// The receiver that pyright sees where ty narrowed a receiver with `hasattr()`, which pyright
+/// doesn't narrow: without ty's synthesized protocols (`<Protocol with members 'x'>`), and
+/// `object` for such a protocol on its own. Returns `None` for receivers without them.
+pub fn pyright_hasattr_receiver<'db>(
+    model: &SemanticModel<'db>,
+    receiver: Type<'db>,
+) -> Option<Type<'db>> {
+    let db = model.db();
+    let is_synthesized_protocol = |ty: &Type<'db>| matches!(ty, Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none());
+    match receiver {
+        Type::ProtocolInstance(_) if is_synthesized_protocol(&receiver) => {
+            Some(KnownClass::Object.to_instance(db, &model.program_environment()))
+        }
+        Type::Intersection(intersection)
+            if intersection
+                .iter_positive(db)
+                .any(|element| is_synthesized_protocol(&element)) =>
+        {
+            let mut rest = intersection
+                .iter_positive(db)
+                .filter(|element| !is_synthesized_protocol(element));
+            match (rest.next(), rest.next()) {
+                (Some(only), None) => Some(only),
+                (None, _) => Some(KnownClass::Object.to_instance(db, &model.program_environment())),
+                (Some(_), Some(_)) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The type of reading `name` through `receiver`.
 pub fn pyright_member_type<'db>(
     model: &SemanticModel<'db>,
     receiver: Type<'db>,

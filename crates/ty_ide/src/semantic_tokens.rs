@@ -36,14 +36,14 @@ use ty_python_semantic::types::ide_support::pyright_tokens::{
     PyrightKeywordArgument, PyrightType, PyrightTypeCategory, PyrightTypeContext,
     pyright_attribute_declarations, pyright_declaration, pyright_declarations,
     pyright_definition_type, pyright_function_definition_is_static,
-    pyright_functional_named_tuple_field, pyright_has_declared_type, pyright_inferred_call_type,
-    pyright_is_dynamic_class_object, pyright_is_generic_class_subscript,
-    pyright_is_narrowed_not_none, pyright_is_pseudo_generic_attribute,
-    pyright_is_type_alias_declaration, pyright_keyword_arguments, pyright_member_type,
-    pyright_method_accessor, pyright_narrowed_receiver_member_type,
-    pyright_parameter_is_method_receiver, pyright_receiver, pyright_slot_type,
-    pyright_symbol_declarations, pyright_symbol_definition, pyright_type, pyright_undecorated_type,
-    pyright_union,
+    pyright_functional_named_tuple_field, pyright_has_declared_type, pyright_hasattr_receiver,
+    pyright_inferred_call_type, pyright_is_dynamic_class_object,
+    pyright_is_generic_class_subscript, pyright_is_narrowed_not_none,
+    pyright_is_pseudo_generic_attribute, pyright_is_type_alias_declaration,
+    pyright_keyword_arguments, pyright_member_type, pyright_method_accessor,
+    pyright_narrowed_receiver_member_type, pyright_parameter_is_method_receiver, pyright_receiver,
+    pyright_slot_type, pyright_symbol_declarations, pyright_symbol_definition, pyright_type,
+    pyright_undecorated_type, pyright_union,
 };
 use ty_python_semantic::types::ide_support::{
     CallArgumentForm, UnreachableRange, call_argument_forms, unreachable_ranges,
@@ -1517,6 +1517,12 @@ impl<'db> SemanticTokenVisitor<'db> {
             ty = Some(member);
         }
         match attribute.ctx {
+            // A member that only a `hasattr()` check provides is unknown for pyright.
+            ExprContext::Load
+                if let Some(stripped) = pyright_hasattr_receiver(self.model, receiver) =>
+            {
+                Some(pyright_member_type(self.model, stripped, name).unwrap_or_else(Type::unknown))
+            }
             // ty narrows an unknown receiver to `Unknown & F` (after `isinstance(x, F)`), and the
             // attribute's type to `Unknown`; pyright narrows the receiver to `F`.
             ExprContext::Load => {
