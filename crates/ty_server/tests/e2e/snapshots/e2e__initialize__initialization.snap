@@ -95,7 +95,9 @@ expression: initialization_result
           "defaultLibrary",
           "builtin",
           "classMember",
-          "parameter"
+          "parameter",
+          "callable",
+          "magic"
         ]
       },
       "range": true,
