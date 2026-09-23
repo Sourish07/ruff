@@ -812,13 +812,26 @@ fn pyright_type_impl<'db>(
             PyrightType::class(type_expression, false)
         }
         Type::Union(union) => {
+            // ty's cycle recovery leaves `Divergent` members in some unions (the type of `x.add`
+            // after `x |= ...` in a loop), which pyright doesn't have.
+            let members: Vec<Type<'db>> = union
+                .elements(db)
+                .iter()
+                .copied()
+                .filter(|element| !matches!(element, Type::Divergent(_)))
+                .collect();
+            if let [member] = members.as_slice() {
+                return pyright_type(model, *member, context);
+            }
+            if members.is_empty() {
+                return PyrightType::unknown();
+            }
             // Pyright's `combineTypes` drops members that are the same type as another, ignoring
             // the object that a method is bound to (`s.lower` for `s: Literal["a", "b"]`).
-            if let Some(method) = identical_bound_methods(db, union) {
+            if let Some(method) = identical_bound_methods(db, &members) {
                 return pyright_type(model, method, context);
             }
-            let elements: Vec<PyrightType<'db>> = union
-                .elements(db)
+            let elements: Vec<PyrightType<'db>> = members
                 .iter()
                 .map(|element| pyright_type(model, *element, context))
                 .collect();
@@ -843,20 +856,36 @@ fn pyright_type_impl<'db>(
 }
 
 /// The first member of a union whose members are all the same method bound to different objects.
-fn identical_bound_methods<'db>(db: &'db dyn Db, union: UnionType<'db>) -> Option<Type<'db>> {
-    let (first, rest) = union.elements(db).split_first()?;
+fn identical_bound_methods<'db>(db: &'db dyn Db, elements: &[Type<'db>]) -> Option<Type<'db>> {
+    let (first, rest) = elements.split_first()?;
     let Type::BoundMethod(first_method) = first else {
         return None;
     };
     let definition = first_method.function(db)?.definition(db);
     let signature = first_method.bound_signatures(db)?;
+    // ty's cycle recovery can bind the same method to `set[Unknown]` and `set[Divergent]`, which
+    // are the same type for pyright.
+    let same_type = |a: Type<'db>, b: Type<'db>| {
+        let is_dynamic = |ty: Type<'db>| matches!(ty, Type::Dynamic(_) | Type::Divergent(_));
+        a == b || (is_dynamic(a) && is_dynamic(b))
+    };
     let is_same = |other: &CallableSignature<'db>| {
         other.overloads.len() == signature.overloads.len()
             && other
                 .overloads
                 .iter()
                 .zip(&signature.overloads)
-                .all(|(a, b)| a.parameters() == b.parameters() && a.return_ty == b.return_ty)
+                .all(|(a, b)| {
+                    let (a_parameters, b_parameters) =
+                        (a.parameters().as_slice(), b.parameters().as_slice());
+                    a_parameters.len() == b_parameters.len()
+                        && a_parameters.iter().zip(b_parameters).all(|(a, b)| {
+                            a.kind() == b.kind()
+                                && a.name() == b.name()
+                                && same_type(a.annotated_type(), b.annotated_type())
+                        })
+                        && same_type(a.return_ty, b.return_ty)
+                })
     };
     rest.iter()
         .all(|element| {
