@@ -1204,6 +1204,24 @@ fn accessor_type<'db>(
     }
 }
 
+/// The return type pyright infers for calling `callee`, if it is a function without a return
+/// annotation (see [`inferred_return_type`]).
+pub fn pyright_inferred_call_type<'db>(
+    model: &SemanticModel<'db>,
+    callee: Type<'db>,
+) -> Option<Type<'db>> {
+    let function = match callee {
+        Type::FunctionLiteral(function) => function,
+        Type::BoundMethod(method) => method.function(model.db())?,
+        _ => return None,
+    };
+    let (overloads, _) = function.overloads_and_implementation(model.db());
+    if !overloads.is_empty() {
+        return None;
+    }
+    inferred_return_type(model, function)
+}
+
 /// Pyright's inferred return type of a function without a return annotation, approximated as the
 /// union of the types of its `return` values. Returns `None` for functions with a return
 /// annotation, generators, and functions that don't return a value.
