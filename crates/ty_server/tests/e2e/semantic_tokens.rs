@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use anyhow::Result;
 use lsp_types::{
     PartialResultParams, SemanticTokensParams, SemanticTokensRequest,
@@ -13,9 +15,13 @@ fn semantic_tokens_survive_changes_to_another_document() -> Result<()> {
     let workspace = SystemPath::new("src");
     let primary = SystemPath::new("src/primary.py");
     let other = SystemPath::new("src/other.py");
-    let source: String = (0..200)
-        .map(|i| format!("def function_{i}(value: int) -> str:\n    return str(value + {i})\n\n"))
-        .collect();
+    let mut source = String::new();
+    for i in 0..200 {
+        writeln!(
+            source,
+            "def function_{i}(value: int) -> str:\n    return str(value + {i})\n"
+        )?;
+    }
     let mut server = TestServerBuilder::new()?
         .with_workspace(workspace, None)?
         .with_file(primary, &source)?
