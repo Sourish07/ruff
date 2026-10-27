@@ -698,7 +698,10 @@ fn pyright_type_impl<'db>(
             SubclassOfInner::TypeVar(type_var) => {
                 let typevar = type_var.typevar(db);
                 PyrightType {
-                    is_synthesized_type_var: matches!(typevar.kind(db), TypeVarKind::TypingSelf),
+                    is_synthesized_type_var: matches!(
+                        typevar.kind(db),
+                        TypeVarKind::TypingSelf { .. }
+                    ),
                     type_var_bound_is_class: true,
                     ..PyrightType::new(PyrightTypeCategory::TypeVar, true, false)
                 }
@@ -793,7 +796,7 @@ fn pyright_type_impl<'db>(
         Type::TypeVar(bound_type_var) => {
             let typevar = bound_type_var.typevar(db);
             PyrightType {
-                is_synthesized_type_var: matches!(typevar.kind(db), TypeVarKind::TypingSelf),
+                is_synthesized_type_var: matches!(typevar.kind(db), TypeVarKind::TypingSelf { .. }),
                 ..PyrightType::new(
                     PyrightTypeCategory::TypeVar,
                     type_expression,
