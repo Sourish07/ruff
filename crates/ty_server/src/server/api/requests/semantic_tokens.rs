@@ -72,4 +72,8 @@ impl BackgroundDocumentRequestHandler for SemanticTokensRequestHandler {
     }
 }
 
-impl RetriableRequestHandler for SemanticTokensRequestHandler {}
+impl RetriableRequestHandler for SemanticTokensRequestHandler {
+    // Changes to other files can cancel this snapshot too. Retry with a fresh
+    // snapshot so clients that retain cached colors on errors get current tokens.
+    const RETRY_ON_CANCELLATION: bool = true;
+}

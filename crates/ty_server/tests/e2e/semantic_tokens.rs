@@ -1,7 +1,68 @@
 use anyhow::Result;
+use lsp_types::{
+    PartialResultParams, SemanticTokensParams, SemanticTokensRequest,
+    TextDocumentContentChangeEvent, TextDocumentContentChangeWholeDocument, TextDocumentIdentifier,
+    WorkDoneProgressParams,
+};
 use ruff_db::system::SystemPath;
 
 use crate::TestServerBuilder;
+
+#[test]
+fn semantic_tokens_survive_changes_to_another_document() -> Result<()> {
+    let workspace = SystemPath::new("src");
+    let primary = SystemPath::new("src/primary.py");
+    let other = SystemPath::new("src/other.py");
+    let source: String = (0..200)
+        .map(|i| format!("def function_{i}(value: int) -> str:\n    return str(value + {i})\n\n"))
+        .collect();
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(workspace, None)?
+        .with_file(primary, &source)?
+        .with_file(other, "value = 0\n")?
+        .build()
+        .wait_until_workspaces_are_initialized();
+    server.open_text_document(primary, &source, 1);
+    server.open_text_document(other, "value = 0\n", 1);
+
+    let uri = server.file_uri(primary);
+    let expected = server
+        .semantic_tokens_full_request(&uri)
+        .ok_or_else(|| anyhow::anyhow!("expected semantic tokens"))?;
+    assert!(!expected.data.is_empty());
+
+    let mut requests = Vec::new();
+    for version in 2..34 {
+        requests.push(
+            server.send_request::<SemanticTokensRequest>(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            }),
+        );
+        // Updating any open file can cancel an in-flight database snapshot, even
+        // though the document whose colors are being requested has not changed.
+        server.change_text_document(
+            other,
+            vec![
+                TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
+                    TextDocumentContentChangeWholeDocument {
+                        text: format!("value = {version}\n"),
+                    },
+                ),
+            ],
+            version,
+        );
+    }
+
+    for request in requests {
+        let actual = server
+            .await_response::<SemanticTokensRequest>(&request)
+            .ok_or_else(|| anyhow::anyhow!("expected semantic tokens after unrelated edits"))?;
+        assert_eq!(actual, expected);
+    }
+    Ok(())
+}
 
 #[test]
 fn script_metadata_is_not_highlighted() -> Result<()> {
